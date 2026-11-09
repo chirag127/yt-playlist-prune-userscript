@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         YT Playlist Prune
 // @namespace    https://github.com/chirag127
-// @version      1.0.1
+// @version      1.0.2
 // @description  Detect unavailable playlist rows and duplicate video IDs. Never removes anything.
 // @author       chirag127
 // @license      MIT
 // @match        https://www.youtube.com/*
-// @require      https://raw.githubusercontent.com/chirag127/yt-core-lib/main/yt-core-lib-1.3.0.js
+// @require      https://raw.githubusercontent.com/chirag127/yt-core-lib/main/yt-core-lib-1.4.0.js
 // @downloadURL  https://raw.githubusercontent.com/chirag127/yt-playlist-prune-userscript/main/yt-playlist-prune.user.js
 // @updateURL    https://raw.githubusercontent.com/chirag127/yt-playlist-prune-userscript/main/yt-playlist-prune.user.js
 // @grant        GM_getValue
@@ -129,7 +129,7 @@
       subtitle: 'Read-only detection of unavailable rows and duplicate IDs.',
       sectionTitle: 'Scan',
       fields: fields,
-      // Core 1.2.0 rebuilds the settings object from its own defaults, so a key it does
+      // Core 1.3.0 rebuilds the settings object from its own defaults, so a key it does
       // not know is dropped when the popup saves. Re-merge this script's keys afterwards.
       onSave: function (next) { Ytk.storeSet('settings', Object.assign({}, before, next)); }
     });
@@ -142,5 +142,8 @@
     Ytk.mountToolbar([{ label: 'Prune', run: prune }]);
   }
   mount();
-  if (!mounted) document.addEventListener('yt-navigate-finish', mount);
+  // The sidebar panel often renders after document-idle, and an in-app navigation
+  // never reloads the page, so both events retry the idempotent mount.
+  document.addEventListener('yt-navigate-finish', mount);
+  document.addEventListener('yt-page-data-updated', mount);
 })();
