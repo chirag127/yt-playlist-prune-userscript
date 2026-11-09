@@ -6,7 +6,7 @@
 // @author       chirag127
 // @license      MIT
 // @match        https://www.youtube.com/*
-// @require https://raw.githubusercontent.com/chirag127/yt-core-lib/main/yt-core-lib-1.2.0.js
+// @require      https://raw.githubusercontent.com/chirag127/yt-core-lib/main/yt-core-lib-1.3.0.js
 // @downloadURL  https://raw.githubusercontent.com/chirag127/yt-playlist-prune-userscript/main/yt-playlist-prune.user.js
 // @updateURL    https://raw.githubusercontent.com/chirag127/yt-playlist-prune-userscript/main/yt-playlist-prune.user.js
 // @grant        GM_getValue
@@ -18,40 +18,62 @@
 // ==/UserScript==
 
 (function () {
+  'use strict';
+
   if (typeof Ytk === 'undefined') { console.error('[yt-playlist-prune] core did not load'); return; }
   if (!Ytk.featureOn('prune', true)) return;
-  if (location.pathname !== '/playlist' && !document.querySelector('ytd-playlist-panel-renderer')) return;
 
-  function options() { return Ytk.storeGet('settings', {}) || {}; }
-  function limit(key, fallback, max) { return Math.max(1, Math.min(max, Number(options()[key]) || fallback)); }
+  const ROW_SEL = 'yt-lockup-view-model, ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer';
 
-  // Keep recommendations outside the playlist out of the scan.
-  function readRows() {
+  function onPlaylistSurface() {
+    return location.pathname === '/playlist' || !!document.querySelector('ytd-playlist-panel-renderer');
+  }
+
+  function raw() { return Ytk.storeGet('settings', {}) || {}; }
+  function cap(key, fallback, max) { return Math.max(1, Math.min(max, parseInt(raw()[key], 10) || fallback)); }
+
+  function rowRoot() {
     const root = location.pathname === '/playlist'
-      ? document.querySelector('ytd-playlist-video-list-renderer, ytd-browse[page-subtype="playlist"]')
+      ? document.querySelector('ytd-playlist-video-list-renderer') || document.querySelector('ytd-browse[page-subtype="playlist"]')
       : document.querySelector('ytd-playlist-panel-renderer');
+    return root || null;
+  }
+
+  // Scoped to the playlist itself so recommendation rails are never counted.
+  function readRows() {
+    const root = rowRoot();
     if (!root) return [];
-    return Array.from(root.querySelectorAll('yt-lockup-view-model, ytd-playlist-video-renderer, ytd-playlist-panel-video-renderer'))
-      .slice(0, limit('pruneRowCap', 5000, 20000)).map(function (node, index) {
-        const data = node.contentId ? node : (node.data && (node.data.lockupViewModel || node.data)) || node.lockupViewModel || node;
-        const item = Ytk.lockupToItem(data) || {};
+    return Array.from(root.querySelectorAll(ROW_SEL)).slice(0, cap('pruneRowCap', 5000, 20000))
+      .map(function (node, index) {
+        const vm = node.data && node.data.lockupViewModel ? Ytk.lockupToItem(node.data.lockupViewModel) : null;
         const titleEl = node.querySelector('yt-lockup-metadata-view-model h3 a, a#video-title, #video-title');
-        const link = titleEl && titleEl.getAttribute('href') ? titleEl : node.querySelector('a[href*="v="]');
+        const link = titleEl || node.querySelector('a[href*="v="]');
         const match = ((link && link.getAttribute('href')) || '').match(/[?&]v=([A-Za-z0-9_-]{11})(?:[&#]|$)/);
-        const id = item.id || (/^[A-Za-z0-9_-]{11}$/.test(data.videoId || '') ? data.videoId : null) || (match && match[1]);
-        const title = (item.title || Ytk.textOf(data.title) || (titleEl && (titleEl.getAttribute('title') || titleEl.textContent)) || '').trim();
-        const texts = Ytk.deepTexts(data).join(' ') + ' ' + (node.textContent || '');
-        const unavailable = /\b(?:deleted|private|unavailable)\s*(?:video)?\b|video (?:is )?(?:not available|removed)/i.test(title)
-          || (!id && /\b(?:deleted|private|unavailable|not available|removed)\b/i.test(texts))
-          || data.isPlayable === false;
-        return { index: index + 1, id: id, title: title, unavailable: unavailable };
+
+        // Two ID sources: the view-model object and the rendered watch link.
+        let id = vm && vm.id;
+        if (!id && /^[A-Za-z0-9_-]{11}$/.test(node.contentId || '')) id = node.contentId;
+        if (!id && match) id = match[1];
+
+        const title = String(
+          (vm && vm.title)
+          || (titleEl && (titleEl.getAttribute('title') || titleEl.textContent))
+          || ''
+        ).trim();
+
+        // Unavailable rows carry wording the API title no longer carries ("[Private video]",
+        // "Video unavailable") and sometimes have no playable link at all.
+        const unavailable = /^\s*\[(deleted|private|unavailable)/i.test(title)
+          || /\b(private|deleted|unavailable)\s+video\b|\bvideo (?:is )?(?:unavailable|private|removed)\b/i.test(title)
+          || !!(node.data && node.data.isPlayable === false)
+          || (!id && /(private|deleted|unavailable|not available|removed)/i.test(node.textContent || ''));
+
+        return { index: index + 1, id: id || null, title: title, unavailable: unavailable };
       });
   }
 
   function prune() {
-    if (location.pathname !== '/playlist' && !document.querySelector('ytd-playlist-panel-renderer')) {
-      Ytk.toast('Open a playlist first.'); return;
-    }
+    if (!onPlaylistSurface()) { Ytk.toast('Open a playlist first.'); return; }
     const rows = readRows();
     const seen = new Set();
     const findings = [];
@@ -64,36 +86,59 @@
       if (duplicate) duplicates++;
       if (row.unavailable || duplicate) findings.push({ row: row, duplicate: duplicate });
     });
-    Ytk.panel('Playlist prune — detection only', function (body) {
-      Ytk.kv(body, 'Rendered rows scanned', rows.length);
+
+    Ytk.panel('Prune — detection only', function (body) {
+      Ytk.kv(body, 'Rows scanned', rows.length);
       Ytk.kv(body, 'Unavailable rows', dead);
       Ytk.kv(body, 'Duplicate occurrences after first', duplicates);
-      Ytk.note(body, 'Loaded rows only, including rows hidden by a filter. Scroll to load more, then scan again. Scan cap: ' + limit('pruneRowCap', 5000, 20000) + '.');
-      if (!rows.length) Ytk.note(body, 'No playlist rows found yet. Wait for the playlist to load and try again.');
-      else if (!findings.length) Ytk.note(body, 'No unavailable rows or duplicate video IDs detected in this scan.', 'ytk2-ok');
-      const show = limit('pruneShowLimit', 80, 1000);
-      findings.slice(0, show).forEach(function (finding) {
-        const row = finding.row;
-        const reasons = [row.unavailable ? 'unavailable' : '', finding.duplicate ? 'duplicate ID ' + row.id : ''].filter(Boolean);
-        Ytk.note(body, '#' + row.index + ' · ' + (row.title || '(untitled unavailable row)') + ' — ' + reasons.join(' · '), 'ytk2-warn');
+      Ytk.note(body, 'Scans the rows currently loaded in the playlist, including rows a filter has hidden. Scroll first to load more, then scan again. Row cap: ' + cap('pruneRowCap', 5000, 20000) + '.');
+
+      if (!rows.length) {
+        Ytk.note(body, 'No playlist rows found. Wait for the playlist to render, then try again.');
+      } else if (!findings.length) {
+        Ytk.note(body, 'No unavailable rows and no duplicate video IDs in this scan.', 'ytk2-ok');
+      }
+
+      const show = cap('pruneShowLimit', 80, 1000);
+      findings.slice(0, show).forEach(function (f) {
+        const reasons = [];
+        if (f.row.unavailable) reasons.push('unavailable');
+        if (f.duplicate) reasons.push('duplicate ID ' + f.row.id);
+        Ytk.note(body, '#' + f.row.index + ' · ' + (f.row.title || '(untitled unavailable row)') + ' — ' + reasons.join(' · '), 'ytk2-warn');
       });
-      if (findings.length > show) Ytk.note(body, (findings.length - show) + ' more findings not displayed. Increase Rows to list in Settings…');
-      Ytk.note(body, 'Nothing is removed. Removal belongs to yt-multiselect: select unavailable / duplicate rows there, then use Remove from this playlist.');
+      if (findings.length > show) {
+        Ytk.note(body, (findings.length - show) + ' more not listed. Raise “Rows to list” in Settings…');
+      }
+
+      Ytk.note(body, 'Nothing is removed here. To remove these, open yt-multiselect, select unavailable / duplicate rows there, and use “Remove from this playlist”.');
     });
-    if (!rows.length) Ytk.toast('No loaded playlist rows to scan.');
+    if (!rows.length) Ytk.toast('No loaded rows to scan.');
   }
 
+  const fields = [
+    { key: 'pruneShowLimit', label: 'Rows to list', type: 'number', def: parseInt(raw().pruneShowLimit, 10) || 80, hint: 'Findings shown in the panel (1–1000).' },
+    { key: 'pruneRowCap', label: 'Maximum loaded rows to scan', type: 'number', def: parseInt(raw().pruneRowCap, 10) || 5000, hint: '1–20000. Keeps a very long playlist from freezing the page.' }
+  ];
+
   GM_registerMenuCommand('Settings…', function () {
-    const saved = options();
-    const fields = [
-      { key: 'pruneShowLimit', label: 'Rows to list', type: 'number', def: saved.pruneShowLimit ?? 80 },
-      { key: 'pruneRowCap', label: 'Maximum loaded rows to scan (1–20000)', type: 'number', def: saved.pruneRowCap ?? 5000 }
-    ];
+    const before = raw();
     Ytk.openSettings({
-      title: 'YT Playlist Prune', subtitle: 'Read-only detection; removal belongs to Multiselect.', sectionTitle: 'Scan limits', fields: fields,
-      // Core 1.2.0 drops custom keys when saving; retain them without modifying the core.
-      onSave: function (next) { Ytk.storeSet('settings', Object.assign({}, saved, Object.fromEntries(fields.map(function (f) { return [f.key, f.def]; })), next)); }
+      title: 'YT Playlist Prune',
+      subtitle: 'Read-only detection of unavailable rows and duplicate IDs.',
+      sectionTitle: 'Scan',
+      fields: fields,
+      // Core 1.2.0 rebuilds the settings object from its own defaults, so a key it does
+      // not know is dropped when the popup saves. Re-merge this script's keys afterwards.
+      onSave: function (next) { Ytk.storeSet('settings', Object.assign({}, before, next)); }
     });
   });
-  Ytk.mountToolbar([{ label: 'Prune', run: prune }]);
+
+  let mounted = false;
+  function mount() {
+    if (mounted || !onPlaylistSurface()) return;
+    mounted = true;
+    Ytk.mountToolbar([{ label: 'Prune', run: prune }]);
+  }
+  mount();
+  if (!mounted) document.addEventListener('yt-navigate-finish', mount);
 })();
